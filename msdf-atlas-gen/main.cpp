@@ -62,7 +62,7 @@ INPUT SPECIFICATION
 #ifndef MSDFGEN_DISABLE_VARIABLE_FONTS
 R"(
   -varfont <filename.ttf/otf?var0=value0&var1=value1>
-      Specifies an input variable font file and configures its variables.)"
+      Specifies an input variable font file and configures its variation axes.)"
 #endif
 R"(
   -charset <filename>
@@ -126,6 +126,8 @@ R"(
 R"(
   -shadronpreview <filename.shadron> <sample text>
       Generates a Shadron script that uses the generated atlas to draw a sample text as a preview.
+  -printvaraxes
+      Prints the list of the variable font's available variation axes.
 
 GLYPH CONFIGURATION
   -size <em size>
@@ -258,7 +260,8 @@ static bool strStartsWith(const char *str, const char *prefix) {
 }
 
 #ifndef MSDFGEN_DISABLE_VARIABLE_FONTS
-static msdfgen::FontHandle *loadVarFont(msdfgen::FreetypeHandle *library, const char *filename) {
+
+static msdfgen::FontHandle *loadVarFont(msdfgen::FreetypeHandle *library, const char *filename, bool &badAxes) {
     std::string buffer;
     while (*filename && *filename != '?')
         buffer.push_back(*filename++);
@@ -269,17 +272,33 @@ static msdfgen::FontHandle *loadVarFont(msdfgen::FreetypeHandle *library, const 
             while (*filename && *filename != '=')
                 buffer.push_back(*filename++);
             if (*filename == '=') {
-                double value = 0;
-                int skip = 0;
-                if (sscanf(++filename, "%lf%n", &value, &skip) == 1) {
-                    msdfgen::setFontVariationAxis(library, font, buffer.c_str(), value);
-                    filename += skip;
+                char *end = nullptr;
+                double value = strtod(++filename, &end);
+                if (end > filename) {
+                    filename = end;
+                    if (!((buffer.size() == 4 && msdfgen::setFontVariationAxis(library, font, msdfgen::FontVariationAxis::Tag(buffer.c_str()), value)) || msdfgen::setFontVariationAxis(library, font, buffer.c_str(), value))) {
+                        badAxes = true;
+                        fprintf(stderr, "Font variation axis \"%s\" not found.\n", buffer.c_str());
+                    }
                 }
             }
         } while (*filename++ == '&');
     }
     return font;
 }
+
+static void printVarFontAxisList(FILE *output, msdfgen::FreetypeHandle *library, msdfgen::FontHandle *font) {
+    std::vector<msdfgen::FontVariationAxis> axes;
+    msdfgen::listFontVariationAxes(axes, library, font);
+    if (axes.empty())
+        fputs("The selected font doesn't appear to contain any variation axes.\n", output);
+    else {
+        fputs("Available font variation axes:\n", output);
+        for (const msdfgen::FontVariationAxis &axis : axes)
+            fprintf(output, "\t[%c%c%c%c] \"%s\" (%.17g to %.17g), default = %.17g\n", axis.tag.characters[0], axis.tag.characters[1], axis.tag.characters[2], axis.tag.characters[3], axis.name, axis.minValue, axis.maxValue, axis.defaultValue);
+    }
+}
+
 #endif
 
 enum class Units {
@@ -320,6 +339,7 @@ struct Configuration {
     GeneratorAttributes generatorAttributes;
     bool preprocessGeometry;
     bool kerning;
+    bool varFontPrintout;
     int threadCount;
     const char *arteryFontFilename;
     const char *imageFilename;
@@ -487,6 +507,10 @@ int main(int argc, const char *const *argv) {
         ARG_CASE("-varfont", 1) {
             fontInput.fontFilename = argv[argPos++];
             fontInput.variableFont = true;
+            continue;
+        }
+        ARG_CASE("-printvaraxes", 0) {
+            config.varFontPrintout = true;
             continue;
         }
     #endif
@@ -935,9 +959,13 @@ int main(int argc, const char *const *argv) {
     }
     if (!fontInput.fontFilename)
         ABORT("No font specified.");
+    bool varFontPrintoutOnly = false;
     if (!(config.arteryFontFilename || config.imageFilename || config.jsonFilename || config.csvFilename || config.shadronPreviewFilename)) {
-        fputs("No output specified.\n", stderr);
-        return 0;
+        if (!config.varFontPrintout) {
+            fputs("No output specified.\n", stderr);
+            return 0;
+        } else
+            varFontPrintoutOnly = true;
     }
     bool layoutOnly = !(config.arteryFontFilename || config.imageFilename);
 
@@ -965,7 +993,7 @@ int main(int argc, const char *const *argv) {
         config.miterLimit = 0;
     if (config.emSize > minEmSize)
         minEmSize = config.emSize;
-    if (!(fixedWidth > 0 && fixedHeight > 0) && !(fixedCellWidth > 0 && fixedCellHeight > 0) && !(minEmSize > 0)) {
+    if (!(fixedWidth > 0 && fixedHeight > 0) && !(fixedCellWidth > 0 && fixedCellHeight > 0) && !(minEmSize > 0) && !varFontPrintoutOnly) {
         fputs("Neither atlas size nor glyph size selected, using default...\n", stderr);
         minEmSize = DEFAULT_SIZE;
     }
@@ -1083,18 +1111,28 @@ int main(int argc, const char *const *argv) {
                     msdfgen::deinitializeFreetype(ft);
                 }
             }
-            bool load(const char *fontFilename, bool isVarFont) {
+            bool load(const char *fontFilename, bool isVarFont, bool varFontPrintout) {
                 if (ft && fontFilename) {
                     if (this->fontFilename && !strcmp(this->fontFilename, fontFilename))
                         return true;
                     if (font)
                         msdfgen::destroyFont(font);
-                    if ((font = (
-                        #ifndef MSDFGEN_DISABLE_VARIABLE_FONTS
-                            isVarFont ? loadVarFont(ft, fontFilename) :
-                        #endif
-                        msdfgen::loadFont(ft, fontFilename)
-                    ))) {
+
+                    #ifndef MSDFGEN_DISABLE_VARIABLE_FONTS
+                        if (isVarFont) {
+                            bool badAxesSpecified = false;
+                            if ((font = loadVarFont(ft, fontFilename, badAxesSpecified))) {
+                                if (varFontPrintout)
+                                    printVarFontAxisList(stdout, ft, font);
+                                else if (badAxesSpecified)
+                                    printVarFontAxisList(stderr, ft, font);
+                            }
+                        } else
+                    #endif
+                    /* if (defined(MSDFGEN_DISABLE_VARIABLE_FONTS) || !isVarFont) */ {
+                        font = msdfgen::loadFont(ft, fontFilename);
+                    }
+                    if (font) {
                         this->fontFilename = fontFilename;
                         return true;
                     }
@@ -1108,8 +1146,10 @@ int main(int argc, const char *const *argv) {
         } font;
 
         for (FontInput &fontInput : fontInputs) {
-            if (!font.load(fontInput.fontFilename, fontInput.variableFont))
+            if (!font.load(fontInput.fontFilename, fontInput.variableFont, config.varFontPrintout))
                 ABORT("Failed to load specified font file.");
+            if (varFontPrintoutOnly)
+                continue;
             if (fontInput.fontScale <= 0)
                 fontInput.fontScale = 1;
 
@@ -1180,6 +1220,8 @@ int main(int argc, const char *const *argv) {
             fonts.push_back((FontGeometry &&) fontGeometry);
         }
     }
+    if (varFontPrintoutOnly)
+        return 0;
     if (glyphs.empty())
         ABORT("No glyphs loaded.");
 
